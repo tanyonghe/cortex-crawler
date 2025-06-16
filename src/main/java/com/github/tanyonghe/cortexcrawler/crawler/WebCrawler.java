@@ -16,12 +16,17 @@ import java.io.IOException;
 import java.net.URL;
 import java.net.MalformedURLException;
 import java.util.regex.Pattern;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class WebCrawler {
     private final PriorityBlockingQueue<CrawlTask> queue = new PriorityBlockingQueue<>();
     private final Set<String> visited = ConcurrentHashMap.newKeySet();
     private final int maxThreads;
     private final RateLimiter rateLimiter;
+    private final Map<String, Long> domainLastCrawlTime = new ConcurrentHashMap<>();
+    private final Map<String, Integer> domainCrawlDelays = new ConcurrentHashMap<>();
+    private final Set<String> allowedDomains;
+    private final Set<String> blockedDomains;
     private static final Set<String> ALLOWED_CONTENT_TYPES = Set.of(
         "text/html",
         "application/xhtml+xml"
@@ -34,10 +39,17 @@ public class WebCrawler {
         "(?i)(?:jsessionid|phpsessid|sid|sessionid|aspsessionid)=[^&]+"
     );
     private static final int MAX_RETRIES = 3;
+    private static final int DEFAULT_CRAWL_DELAY = 1000; // 1 second default delay
 
     public WebCrawler(int maxThreads, double requestsPerSecond) {
+        this(maxThreads, requestsPerSecond, new HashSet<>(), new HashSet<>());
+    }
+
+    public WebCrawler(int maxThreads, double requestsPerSecond, Set<String> allowedDomains, Set<String> blockedDomains) {
         this.maxThreads = maxThreads;
         this.rateLimiter = new RateLimiter(requestsPerSecond);
+        this.allowedDomains = new HashSet<>(allowedDomains);
+        this.blockedDomains = new HashSet<>(blockedDomains);
     }
 
     public void addUrl(String url, int priority) {
@@ -90,12 +102,22 @@ public class WebCrawler {
     private boolean isValidUrl(String url) {
         try {
             URL parsedUrl = new URL(url);
+            String host = parsedUrl.getHost();
+            
+            // Check domain allowlist/blocklist
+            if (!allowedDomains.isEmpty() && !allowedDomains.contains(host)) {
+                return false;
+            }
+            if (blockedDomains.contains(host)) {
+                return false;
+            }
+
             // Only allow HTTP and HTTPS protocols
             if (!parsedUrl.getProtocol().equals("http") && !parsedUrl.getProtocol().equals("https")) {
                 return false;
             }
             // Validate host is not empty
-            if (parsedUrl.getHost().isEmpty()) {
+            if (host.isEmpty()) {
                 return false;
             }
             // Check for blocked file extensions
@@ -106,6 +128,69 @@ public class WebCrawler {
             return true;
         } catch (MalformedURLException e) {
             return false;
+        }
+    }
+
+    private void checkAndUpdateRobotsTxt(String url) {
+        try {
+            URL parsedUrl = new URL(url);
+            String host = parsedUrl.getHost();
+            String robotsTxtUrl = parsedUrl.getProtocol() + "://" + host + "/robots.txt";
+
+            if (!domainCrawlDelays.containsKey(host)) {
+                try (CloseableHttpClient httpClient = HttpClients.createDefault()) {
+                    HttpGet request = new HttpGet(robotsTxtUrl);
+                    String content = httpClient.execute(request, response -> {
+                        if (response.getCode() == 200) {
+                            return EntityUtils.toString(response.getEntity());
+                        }
+                        return "";
+                    });
+
+                    // Parse robots.txt
+                    boolean isUserAgentMatch = false;
+                    int crawlDelay = DEFAULT_CRAWL_DELAY;
+                    for (String line : content.split("\n")) {
+                        line = line.trim();
+                        if (line.startsWith("User-agent:")) {
+                            isUserAgentMatch = line.substring(11).trim().equals("*");
+                        } else if (isUserAgentMatch && line.startsWith("Crawl-delay:")) {
+                            try {
+                                crawlDelay = (int) (Double.parseDouble(line.substring(12).trim()) * 1000);
+                            } catch (NumberFormatException e) {
+                                // Use default if parsing fails
+                            }
+                        }
+                    }
+                    domainCrawlDelays.put(host, crawlDelay);
+                } catch (Exception e) {
+                    // If robots.txt is not accessible, use default delay
+                    domainCrawlDelays.put(host, DEFAULT_CRAWL_DELAY);
+                }
+            }
+        } catch (MalformedURLException e) {
+            // Invalid URL, use default delay
+        }
+    }
+
+    private void respectCrawlDelay(String url) {
+        try {
+            URL parsedUrl = new URL(url);
+            String host = parsedUrl.getHost();
+            
+            checkAndUpdateRobotsTxt(url);
+            
+            long lastCrawlTime = domainLastCrawlTime.getOrDefault(host, 0L);
+            int crawlDelay = domainCrawlDelays.getOrDefault(host, DEFAULT_CRAWL_DELAY);
+            long currentTime = System.currentTimeMillis();
+            
+            if (currentTime - lastCrawlTime < crawlDelay) {
+                Thread.sleep(crawlDelay - (currentTime - lastCrawlTime));
+            }
+            
+            domainLastCrawlTime.put(host, System.currentTimeMillis());
+        } catch (Exception e) {
+            // If anything goes wrong, just continue
         }
     }
 
@@ -139,6 +224,8 @@ public class WebCrawler {
         int retries = 0;
         while (retries < MAX_RETRIES) {
             try (CloseableHttpClient httpClient = HttpClients.createDefault()) {
+                respectCrawlDelay(task.getUrl());
+                
                 HttpGet request = new HttpGet(task.getUrl());
                 // Set timeouts
                 RequestConfig requestConfig = RequestConfig.custom()
@@ -165,7 +252,7 @@ public class WebCrawler {
                     return EntityUtils.toString(response.getEntity());
                 });
 
-                Document doc = Jsoup.parse(html);
+                Document doc = Jsoup.parse(html, task.getUrl());
                 Elements links = doc.select("a[href]");
                 
                 int newPriority = task.getPriority() - 1;
@@ -183,7 +270,7 @@ public class WebCrawler {
                 } else {
                     System.out.println("Retry " + retries + " for " + task.getUrl() + ": " + e.getMessage());
                     try {
-                        Thread.sleep(1000 * retries); // Exponential backoff
+                        Thread.sleep(1000L * retries); // Exponential backoff
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         break;
