@@ -48,11 +48,14 @@ public class WebCrawler {
     public WebCrawler(int maxThreads, double requestsPerSecond, Set<String> allowedDomains, Set<String> blockedDomains) {
         this.maxThreads = maxThreads;
         this.rateLimiter = new RateLimiter(requestsPerSecond);
-        this.allowedDomains = new HashSet<>(allowedDomains);
-        this.blockedDomains = new HashSet<>(blockedDomains);
+        this.allowedDomains = allowedDomains;
+        this.blockedDomains = blockedDomains;
     }
 
     public void addUrl(String url, int priority) {
+        if (priority <= 0) {
+            return;
+        }
         String normalizedUrl = normalizeUrl(url);
         if (normalizedUrl != null && isValidUrl(normalizedUrl) && visited.add(normalizedUrl)) {
             queue.add(new CrawlTask(normalizedUrl, priority));
@@ -216,9 +219,6 @@ public class WebCrawler {
     }
 
     private void process(CrawlTask task) {
-        if (task.getPriority() <= 0) {
-            return;
-        }
         System.out.println("Crawling: " + task.getUrl() + ", priority: " + task.getPriority());
         
         int retries = 0;
@@ -278,5 +278,10 @@ public class WebCrawler {
                 }
             }
         }
+    }
+
+    // For testing purposes
+    public boolean isVisited(String url) {
+        return visited.contains(url);
     }
 }
